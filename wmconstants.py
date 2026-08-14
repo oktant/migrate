@@ -5,6 +5,7 @@ GROUP_OBJECT = "groups"
 WORKSPACE_ITEM_LOG_OBJECT = "workspace_item_log"
 WORKSPACE_NOTEBOOK_PATH_OBJECT = "notebook_paths"
 WORKSPACE_NOTEBOOK_OBJECT = "notebooks"
+WORKSPACE_FILE_OBJECT = "workspace_files"
 WORKSPACE_DIRECTORY_OBJECT = "directories"
 WORKSPACE_REPO_OBJECT = "repos"
 WORKSPACE_NOTEBOOK_ACL_OBJECT = "acl_notebooks"
@@ -37,6 +38,7 @@ GROUPS = "groups"
 WORKSPACE_ITEM_LOG = "workspace_item_log"
 WORKSPACE_ACLS = "workspace_acls"
 NOTEBOOKS = "notebooks"
+WORKSPACE_FILES = "workspace_files"
 SECRETS = "secrets"
 CLUSTERS = "clusters"
 INSTANCE_POOLS = "instance_pools"
@@ -54,6 +56,7 @@ TASK_OBJECTS = [
     WORKSPACE_ITEM_LOG,
     WORKSPACE_ACLS,
     NOTEBOOKS,
+    WORKSPACE_FILES,
     SECRETS,
     CLUSTERS,
     INSTANCE_POOLS,

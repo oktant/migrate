@@ -80,7 +80,7 @@ def get_export_parser():
 
     # log all user workspace paths
     parser.add_argument('--workspace', action='store_true',
-                        help='Log all the notebook paths in the workspace. (metadata only)')
+                        help='Log all the notebook and workspace file paths in the workspace. (metadata only)')
 
     parser.add_argument('--notebook-format', type=NotebookFormat,
                         choices=list(NotebookFormat), default=NotebookFormat.dbc,
@@ -88,7 +88,7 @@ def get_export_parser():
 
     # download all user workspace notebooks
     parser.add_argument('--download', action='store_true',
-                        help='Download all notebooks for the environment')
+                        help='Download all notebooks and non-notebook workspace files for the environment')
 
     # add all lib configs
     parser.add_argument('--libs', action='store_true',
@@ -251,7 +251,7 @@ def get_import_parser():
 
     # import all notebooks
     parser.add_argument('--workspace', action='store_true',
-                        help='Import all notebooks from export dir into the workspace.')
+                        help='Import all notebooks and non-notebook workspace files from export dir into the workspace.')
 
     # skip previous successful imports
     parser.add_argument('--restart-from-checkpoint', action='store_true',
