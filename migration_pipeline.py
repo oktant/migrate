@@ -90,6 +90,7 @@ def build_export_pipeline(client_config, checkpoint_service, args) -> Pipeline:
     export_instance_profiles -> export_users -> export_groups -> export_secrets -> export_clusters -> export_instance_pools -> export_jobs
                                                               -> log_workspace_items -> export_workspace_acls
                                                               -> export_notebooks
+                                                              -> export_workspace_files
                                                               -> export_metastore -> export_metastore_table_acls
     """
     if args.keep_tasks:
@@ -110,6 +111,7 @@ def build_export_pipeline(client_config, checkpoint_service, args) -> Pipeline:
     workspace_item_log_export = pipeline.add_task(WorkspaceItemLogExportTask(client_config, args, checkpoint_service, wmconstants.WORKSPACE_ITEM_LOG in skip_tasks), [export_groups])
     export_workspace_acls = pipeline.add_task(WorkspaceACLExportTask(client_config, checkpoint_service, wmconstants.WORKSPACE_ACLS in skip_tasks), [workspace_item_log_export])
     export_notebooks = pipeline.add_task(NotebookExportTask(client_config, checkpoint_service, wmconstants.NOTEBOOKS in skip_tasks), [workspace_item_log_export])
+    export_workspace_files = pipeline.add_task(WorkspaceFileExportTask(client_config, checkpoint_service, wmconstants.WORKSPACE_FILES in skip_tasks), [workspace_item_log_export])
     export_secrets = pipeline.add_task(SecretExportTask(client_config, args, checkpoint_service, wmconstants.SECRETS in skip_tasks), [export_groups])
     export_clusters = pipeline.add_task(ClustersExportTask(client_config, args, checkpoint_service, wmconstants.CLUSTERS in skip_tasks), [export_secrets])
     export_instance_pools = pipeline.add_task(InstancePoolsExportTask(client_config, args, checkpoint_service, wmconstants.INSTANCE_POOLS in skip_tasks), [export_clusters])
@@ -118,7 +120,7 @@ def build_export_pipeline(client_config, checkpoint_service, args) -> Pipeline:
     export_metastore_table_acls = pipeline.add_task(MetastoreTableACLExportTask(client_config, args, checkpoint_service, wmconstants.METASTORE_TABLE_ACLS in skip_tasks), [export_metastore])
     # FinishExport task is never skipped
     finish_export = pipeline.add_task(FinishExportTask(client_config),
-                                      [export_workspace_acls, export_notebooks, export_jobs,
+                                      [export_workspace_acls, export_notebooks, export_workspace_files, export_jobs,
                                        export_metastore_table_acls])
 
     return pipeline
@@ -129,6 +131,7 @@ def build_import_pipeline(client_config, checkpoint_service, args) -> Pipeline:
     All import jobs
     import_instance_profiles -> import_users -> import_groups -> import_secrets -> import_clusters -> import_instance_pools -> import_jobs
                                                               -> log_workspace_items -> import_notebooks -> import_workspace_acls
+                                                                                                        -> import_workspace_files
                                                               -> import_metastore -> import_metastore_table_acls
     """
     # allow skipping/keeping tasks for import in addition to export
@@ -153,6 +156,7 @@ def build_import_pipeline(client_config, checkpoint_service, args) -> Pipeline:
     import_users = pipeline.add_task(UserImportTask(client_config, checkpoint_service, wmconstants.USERS in skip_tasks), [import_instance_profiles])
     import_groups = pipeline.add_task(GroupImportTask(client_config, checkpoint_service, wmconstants.GROUPS in skip_tasks), [import_users])
     import_notebooks = pipeline.add_task(NotebookImportTask(client_config, checkpoint_service, args, wmconstants.NOTEBOOKS in skip_tasks), [import_groups])
+    import_workspace_files = pipeline.add_task(WorkspaceFileImportTask(client_config, checkpoint_service, args, wmconstants.WORKSPACE_FILES in skip_tasks), [import_notebooks])
     import_workspace_acls = pipeline.add_task(WorkspaceACLImportTask(client_config, checkpoint_service, wmconstants.WORKSPACE_ACLS in skip_tasks), [import_notebooks])
     import_secrets = pipeline.add_task(SecretImportTask(client_config, checkpoint_service, wmconstants.SECRETS in skip_tasks), [import_groups])
     import_instance_pools = pipeline.add_task(InstancePoolsImportTask(client_config, args, checkpoint_service, wmconstants.INSTANCE_POOLS in skip_tasks), [import_secrets])
@@ -247,6 +251,11 @@ def build_validate_pipeline(client_config, checkpoint_service, args):
     add_diff_task("validate-user_dirs", "user_dirs.log", workspace_item_config, skip=(wmconstants.WORKSPACE_ITEM_LOG in skip_tasks))
     add_diff_task("validate-user_workspace", "user_workspace.log", workspace_item_config, skip=(wmconstants.WORKSPACE_ITEM_LOG in skip_tasks))
     add_diff_task("validate-libraries", "libraries.log", workspace_item_config, skip=(wmconstants.WORKSPACE_ITEM_LOG in skip_tasks))
+    # sessions exported before workspace file support have no workspace_files.log to compare against
+    workspace_files_log_missing = not (os.path.exists(os.path.join(source_dir, "workspace_files.log"))
+                                       and os.path.exists(os.path.join(destination_dir, "workspace_files.log")))
+    add_diff_task("validate-workspace_files", "workspace_files.log", workspace_item_config,
+                  skip=(wmconstants.WORKSPACE_ITEM_LOG in skip_tasks or workspace_files_log_missing))
     
     # WorkspaceACLExportTask
     acl_config = DiffConfig(

@@ -63,6 +63,8 @@ def main():
                 raise ValueError('Overwrite notebooks only supports the SOURCE format. See Rest API docs for details')
         # log notebooks and libraries
         ws_c.import_all_workspace_items(archive_missing=args.archive_missing, num_parallel=args.num_parallel)
+        # upload the non-notebook workspace files, e.g. csv / xlsx data files
+        ws_c.import_all_workspace_files(archive_missing=args.archive_missing, num_parallel=args.num_parallel)
         end = timer()
         print("Complete Workspace Import Time: " + str(timedelta(seconds=end - start)))
 

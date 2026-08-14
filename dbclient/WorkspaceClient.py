@@ -56,6 +56,7 @@ class WorkspaceClient(dbclient):
         workspace_log_writer = ThreadSafeWriter(self.get_export_dir() + 'user_workspace.log', "a")
         libs_log_writer = ThreadSafeWriter(self.get_export_dir() + 'libraries.log', "a")
         dir_log_writer = ThreadSafeWriter(self.get_export_dir() + 'user_dirs.log', "a")
+        files_log_writer = ThreadSafeWriter(self.get_export_dir() + 'workspace_files.log', "a")
         checkpoint_item_log_set = self._checkpoint_service.get_checkpoint_key_set(
             wmconstants.WM_EXPORT, wmconstants.WORKSPACE_ITEM_LOG_OBJECT
         )
@@ -63,16 +64,24 @@ class WorkspaceClient(dbclient):
             for tld_obj in ls_tld:
                 # obj has 3 keys, object_type, path, object_id
                 tld_path = tld_obj.get('path')
-                log_count = self.log_all_workspace_items(
-                    tld_path, workspace_log_writer, libs_log_writer, dir_log_writer, checkpoint_item_log_set)
+                log_count = self.log_all_workspace_items(ws_path=tld_path,
+                                                         workspace_log_writer=workspace_log_writer,
+                                                         libs_log_writer=libs_log_writer,
+                                                         dir_log_writer=dir_log_writer,
+                                                         repos_log_writer=None,
+                                                         checkpoint_set=checkpoint_item_log_set,
+                                                         files_log_writer=files_log_writer)
                 logged_nb_count += log_count
         finally:
             workspace_log_writer.close()
             libs_log_writer.close()
             dir_log_writer.close()
+            files_log_writer.close()
         dl_nb_count = self.download_notebooks()
+        dl_file_count = self.download_workspace_files()
         print(f'Total logged notebooks: {logged_nb_count}')
         print(f'Total Downloaded notebooks: {dl_nb_count}')
+        print(f'Total Downloaded workspace files: {dl_file_count}')
 
     def get_user_import_args(self, full_local_path, nb_full_path):
         """
@@ -204,22 +213,31 @@ class WorkspaceClient(dbclient):
         workspace_log_writer = ThreadSafeWriter(self.get_export_dir() + 'user_workspace.log', "a")
         libs_log_writer = ThreadSafeWriter(self.get_export_dir() + 'libraries.log', "a")
         dir_log_writer = ThreadSafeWriter(self.get_export_dir() + 'user_dirs.log', "a")
+        files_log_writer = ThreadSafeWriter(self.get_export_dir() + 'workspace_files.log', "a")
         checkpoint_item_log_set = self._checkpoint_service.get_checkpoint_key_set(
             wmconstants.WM_EXPORT, wmconstants.WORKSPACE_ITEM_LOG_OBJECT
         )
         try:
-            num_of_nbs = self.log_all_workspace_items(
-                user_root, workspace_log_writer, libs_log_writer, dir_log_writer, checkpoint_item_log_set)
+            num_of_nbs = self.log_all_workspace_items(ws_path=user_root,
+                                                      workspace_log_writer=workspace_log_writer,
+                                                      libs_log_writer=libs_log_writer,
+                                                      dir_log_writer=dir_log_writer,
+                                                      repos_log_writer=None,
+                                                      checkpoint_set=checkpoint_item_log_set,
+                                                      files_log_writer=files_log_writer)
         finally:
             workspace_log_writer.close()
             libs_log_writer.close()
             dir_log_writer.close()
+            files_log_writer.close()
 
         if num_of_nbs == 0:
             raise ValueError('User does not have any notebooks in this path. Please verify the case of the email')
         num_of_nbs_dl = self.download_notebooks(ws_dir='user_artifacts/')
+        num_of_files_dl = self.download_workspace_files(ws_dir='user_file_artifacts/')
         print(f"Total notebooks logged: {num_of_nbs}")
         print(f"Total notebooks downloaded: {num_of_nbs_dl}")
+        print(f"Total workspace files downloaded: {num_of_files_dl}")
         if num_of_nbs != num_of_nbs_dl:
             print(f"Notebooks logged != downloaded. Check the failed download file at: {user_export_dir}")
         print(f"Exporting the notebook permissions for {username}")
@@ -285,6 +303,9 @@ class WorkspaceClient(dbclient):
                 resp_upload = self.post(WS_IMPORT, nb_input_args)
                 if self.is_verbose():
                     print(resp_upload)
+
+        # upload the user's non-notebook workspace files, e.g. csv / xlsx data files
+        self.import_all_workspace_files(artifact_dir='user_file_artifacts/')
 
         # import the user's workspace ACLs
         notebook_acl_logs = user_import_dir + f'/{username}/acl_notebooks.log'
@@ -357,17 +378,7 @@ class WorkspaceClient(dbclient):
                 resp['path'] = notebook_path
                 logging_utils.log_response_error(error_logger, resp)
             return resp
-        nb_path = os.path.dirname(notebook_path)
-        if nb_path != '/':
-            # path is NOT empty, remove the trailing slash from export_dir
-            save_path = export_dir[:-1] + nb_path + '/'
-        else:
-            save_path = export_dir
-
-        # If the local path doesn't exist,we create it before we save the contents
-        if not os.path.exists(save_path) and save_path:
-            os.makedirs(save_path, exist_ok=True)
-
+        save_path = self.get_local_save_path(notebook_path, export_dir)
         save_filename = save_path + os.path.basename(notebook_path) + '.' + resp.get('file_type')
         if os.path.isfile(save_filename):
             logging.warning(f"Notebook file {save_filename} already exists; please rename in source workspace. "
@@ -379,14 +390,102 @@ class WorkspaceClient(dbclient):
         checkpoint_notebook_set.write(notebook_path)
         return {'path': notebook_path}
 
+    @staticmethod
+    def get_local_save_path(ws_path, export_dir):
+        """
+        Map a workspace object path to the local directory it is saved into, creating it if needed
+        :param ws_path: full workspace path of the object, e.g. /Users/foo@db.com/bar.csv
+        :param export_dir: local directory that mirrors the workspace, with a trailing slash
+        :return: the local directory to save this object into, with a trailing slash
+        """
+        parent_path = os.path.dirname(ws_path)
+        if parent_path != '/':
+            # path is NOT empty, remove the trailing slash from export_dir
+            save_path = export_dir[:-1] + parent_path + '/'
+        else:
+            save_path = export_dir
+
+        # If the local path doesn't exist,we create it before we save the contents
+        if not os.path.exists(save_path) and save_path:
+            os.makedirs(save_path, exist_ok=True)
+        return save_path
+
+    def download_workspace_files(self, ws_log_file='workspace_files.log', ws_dir='file_artifacts/', num_parallel=4):
+        """
+        Loop through all non-notebook workspace file paths in the logfile and download them individually.
+        These are files such as csv / xlsx / json data files that live next to notebooks in the workspace.
+        They are stored separately from the notebook artifacts because they are imported with a different API format.
+        :param ws_log_file: logfile for all workspace file paths in the workspace
+        :param ws_dir: export directory to store all workspace files
+        :return: number of files downloaded
+        """
+        checkpoint_file_set = self._checkpoint_service.get_checkpoint_key_set(
+            wmconstants.WM_EXPORT, wmconstants.WORKSPACE_FILE_OBJECT)
+        ws_log = self.get_export_dir() + ws_log_file
+        file_error_logger = logging_utils.get_error_logger(
+            wmconstants.WM_EXPORT, wmconstants.WORKSPACE_FILE_OBJECT, self.get_export_dir())
+        num_files = 0
+        if not os.path.exists(ws_log):
+            # a workspace without any non-notebook files, or a log from an export before files were supported
+            logging.info(f"No workspace file log exists at {ws_log}. Skipping workspace file download ...")
+            return num_files
+        with open(ws_log, "r", encoding='utf-8') as fp:
+            with ThreadPoolExecutor(max_workers=num_parallel) as executor:
+                futures = [executor.submit(self.download_workspace_file_helper, file_data, checkpoint_file_set, file_error_logger, self.get_export_dir() + ws_dir) for file_data in fp]
+                for future in concurrent.futures.as_completed(futures):
+                    dl_resp = future.result()
+                    if 'error' not in dl_resp:
+                        num_files += 1
+        return num_files
+
+    def download_workspace_file_helper(self, file_data, checkpoint_file_set, error_logger, export_dir='file_artifacts/'):
+        """
+        Helper function to download an individual workspace file, or log the failure in the failure logfile.
+        Workspace files are always exported with the AUTO format since DBC / SOURCE only apply to notebooks.
+        :param file_data: a single line of the workspace file log, containing the path and object_id
+        :param export_dir: directory to store all workspace files
+        :return: return the file path that's successfully downloaded
+        """
+        file_path = json.loads(file_data).get('path', None).rstrip('\n')
+        if checkpoint_file_set.contains(file_path):
+            return {'path': file_path}
+        get_args = {'path': file_path, 'format': 'AUTO'}
+        if self.is_verbose():
+            logging.info("Downloading: {0}".format(get_args['path']))
+        resp = self.get(WS_EXPORT, get_args)
+        if resp.get('error', None):
+            resp['path'] = file_path
+            logging_utils.log_response_error(error_logger, resp)
+            return resp
+        if resp.get('error_code', None):
+            if self.skip_large_nb and resp.get("message", None) == 'Size exceeds 10485760 bytes':
+                logging.info("Workspace file {} skipped due to size exceeding limit".format(file_path))
+            else:
+                resp['path'] = file_path
+                logging_utils.log_response_error(error_logger, resp)
+            return resp
+
+        save_path = self.get_local_save_path(file_path, export_dir)
+        # unlike notebooks, the workspace path of a file already contains its extension, so it is kept as is
+        save_filename = save_path + os.path.basename(file_path)
+        if os.path.isfile(save_filename):
+            logging.warning(f"Workspace file {save_filename} already exists; please rename in source workspace. "
+                            f"Note that files are case-insensitive")
+            return {}
+
+        with open(save_filename, "wb") as f:
+            f.write(base64.b64decode(resp['content']))
+        checkpoint_file_set.write(file_path)
+        return {'path': file_path}
+
     def filter_workspace_items(self, item_list, item_type):
         """
         Helper function to filter on different workspace types.
         :param item_list: iterable of workspace items
-        :param item_type: DIRECTORY, NOTEBOOK, LIBRARY
+        :param item_type: DIRECTORY, NOTEBOOK, LIBRARY, FILE
         :return: list of items filtered by type
         """
-        supported_types = {'DIRECTORY', 'NOTEBOOK', 'LIBRARY'}
+        supported_types = {'DIRECTORY', 'NOTEBOOK', 'LIBRARY', 'FILE'}
         if item_type not in supported_types:
             raise ValueError('Unsupported type provided: {0}.\n. Supported types: {1}'.format(item_type,
                                                                                               str(supported_types)))
@@ -396,13 +495,15 @@ class WorkspaceClient(dbclient):
         return filtered_list
 
     def init_workspace_logfiles(self, workspace_log_file='user_workspace.log',
-                                libs_log_file='libraries.log', workspace_dir_log_file='user_dirs.log'):
+                                libs_log_file='libraries.log', workspace_dir_log_file='user_dirs.log',
+                                files_log_file='workspace_files.log'):
         """
         initialize the logfile locations since we run a recursive function to download notebooks
         """
         workspace_log = self.get_export_dir() + workspace_log_file
         libs_log = self.get_export_dir() + libs_log_file
         workspace_dir_log = self.get_export_dir() + workspace_dir_log_file
+        workspace_files_log = self.get_export_dir() + files_log_file
         if not self._checkpoint_service.checkpoint_file_exists(wmconstants.WM_EXPORT, wmconstants.WORKSPACE_ITEM_LOG_OBJECT):
             if os.path.exists(workspace_log):
                 os.remove(workspace_log)
@@ -410,14 +511,17 @@ class WorkspaceClient(dbclient):
                 os.remove(workspace_dir_log)
             if os.path.exists(libs_log):
                 os.remove(libs_log)
+            if os.path.exists(workspace_files_log):
+                os.remove(workspace_files_log)
 
-    def log_all_workspace_items_entry(self, ws_path='/', workspace_log_file='user_workspace.log', libs_log_file='libraries.log', dir_log_file='user_dirs.log', repos_log_file='repos.log', exclude_prefixes=[]):
+    def log_all_workspace_items_entry(self, ws_path='/', workspace_log_file='user_workspace.log', libs_log_file='libraries.log', dir_log_file='user_dirs.log', repos_log_file='repos.log', files_log_file='workspace_files.log', exclude_prefixes=[]):
         logging.info(f"Skip all paths with the following prefixes: {exclude_prefixes}")
 
         workspace_log_writer = ThreadSafeWriter(self.get_export_dir() + workspace_log_file, "a")
         libs_log_writer = ThreadSafeWriter(self.get_export_dir() + libs_log_file, "a")
         dir_log_writer = ThreadSafeWriter(self.get_export_dir() + dir_log_file, "a")
         repos_log_writer = ThreadSafeWriter(self.get_export_dir() + repos_log_file, "a")
+        files_log_writer = ThreadSafeWriter(self.get_export_dir() + files_log_file, "a")
         checkpoint_item_log_set = self._checkpoint_service.get_checkpoint_key_set(
             wmconstants.WM_EXPORT, wmconstants.WORKSPACE_ITEM_LOG_OBJECT
         )
@@ -428,22 +532,40 @@ class WorkspaceClient(dbclient):
                                                    dir_log_writer=dir_log_writer,
                                                    repos_log_writer=repos_log_writer,
                                                    checkpoint_set=checkpoint_item_log_set,
+                                                   files_log_writer=files_log_writer,
                                                    exclude_prefixes=exclude_prefixes)
         finally:
             workspace_log_writer.close()
             libs_log_writer.close()
             dir_log_writer.close()
             repos_log_writer.close()
+            files_log_writer.close()
 
         return num_nbs
 
-    def log_all_workspace_items(self, ws_path, workspace_log_writer, libs_log_writer, dir_log_writer, repos_log_writer, checkpoint_set, exclude_prefixes=[]):
+    def is_group_excluded(self, ws_path, ws_users):
+        """
+        Checks whether a workspace item belongs to a user outside of the `groups_to_keep` filter.
+        Items outside of a user's home directory are never excluded, since they have no owning user.
+        :param ws_path: workspace path of the item
+        :param ws_users: the SCIM user list of the source workspace, including their group membership
+        :return: True if the item should be skipped
+        """
+        if not self.groups_to_keep or not self.is_user_ws_item(ws_path):
+            return False
+        item_user = self.get_user(ws_path)
+        user_groups = [group.get("display") for user in ws_users
+                       if user.get("emails")[0].get("value") == item_user for group in user.get("groups")]
+        return not set(user_groups).intersection(set(self.groups_to_keep))
+
+    def log_all_workspace_items(self, ws_path, workspace_log_writer, libs_log_writer, dir_log_writer, repos_log_writer, checkpoint_set, files_log_writer=None, exclude_prefixes=[]):
         """
         Loop and log all workspace items to download them at a later time
         :param ws_path: root path to log all the items of the notebook workspace
         :param workspace_log_file: logfile to store all the paths of the notebooks
         :param libs_log_file: library logfile to store workspace libraries
         :param dir_log_file: log directory for users
+        :param files_log_writer: logfile to store all the paths of the non-notebook workspace files
         :return:
         """
         # define log file names for notebooks, folders, and libraries
@@ -466,6 +588,8 @@ class WorkspaceClient(dbclient):
             # should be no notebooks, but lets filter and can check later
             notebooks = self.filter_workspace_items(items, 'NOTEBOOK')
             libraries = self.filter_workspace_items(items, 'LIBRARY')
+            # non-notebook workspace files, e.g. csv / xlsx / json data files checked into the workspace
+            workspace_files = self.filter_workspace_items(items, 'FILE')
             # only get user list if we are filtering by group
             ws_users = self.get('/preview/scim/v2/Users').get('Resources', None) if self.groups_to_keep else []
             for x in notebooks:
@@ -473,13 +597,10 @@ class WorkspaceClient(dbclient):
                 nb_path = x.get('path')
 
                 # if the current user is not in kept groups, skip this nb
-                if self.groups_to_keep and self.is_user_ws_item(nb_path):
-                    nb_user = self.get_user(nb_path)
-                    user_groups = [group.get("display") for user in ws_users if user.get("emails")[0].get("value") == nb_user for group in user.get("groups")]
-                    if not set(user_groups).intersection(set(self.groups_to_keep)):
-                        if self.is_verbose():
-                            logging.info("Skipped notebook path due to group exclusion: {0}".format(x.get('path')))
-                        continue
+                if self.is_group_excluded(nb_path, ws_users):
+                    if self.is_verbose():
+                        logging.info("Skipped notebook path due to group exclusion: {0}".format(x.get('path')))
+                    continue
 
                 if not checkpoint_set.contains(nb_path) and not nb_path.startswith(tuple(exclude_prefixes)):
                     if self.is_verbose():
@@ -491,17 +612,29 @@ class WorkspaceClient(dbclient):
                 lib_path = y.get('path')
 
                 # if the current user is not in kept groups, skip this lib
-                if self.groups_to_keep and self.is_user_ws_item(lib_path):
-                    nb_user = self.get_user(lib_path)
-                    user_groups = [group.get("display") for user in ws_users if user.get("emails")[0].get("value") == nb_user for group in user.get("groups")]
-                    if not set(user_groups).intersection(set(self.groups_to_keep)):
-                        if self.is_verbose():
-                            logging.info("Skipped library path due to group exclusion: {0}".format(lib_path))
-                        continue
+                if self.is_group_excluded(lib_path, ws_users):
+                    if self.is_verbose():
+                        logging.info("Skipped library path due to group exclusion: {0}".format(lib_path))
+                    continue
 
                 if not checkpoint_set.contains(lib_path) and not lib_path.startswith(tuple(exclude_prefixes)):
                     libs_log_writer.write(json.dumps(y) + '\n')
                     checkpoint_set.write(lib_path)
+            if files_log_writer:
+                for f in workspace_files:
+                    file_path = f.get('path')
+
+                    # if the current user is not in kept groups, skip this file
+                    if self.is_group_excluded(file_path, ws_users):
+                        if self.is_verbose():
+                            logging.info("Skipped workspace file path due to group exclusion: {0}".format(file_path))
+                        continue
+
+                    if not checkpoint_set.contains(file_path) and not file_path.startswith(tuple(exclude_prefixes)):
+                        if self.is_verbose():
+                            logging.info("Saving workspace file path: {0}".format(file_path))
+                        files_log_writer.write(json.dumps(f) + '\n')
+                        checkpoint_set.write(file_path)
             # log all directories to export permissions
             if folders:
                 def _recurse_log_all_workspace_items(folder):
@@ -514,20 +647,17 @@ class WorkspaceClient(dbclient):
                                                             dir_log_writer=dir_log_writer,
                                                             repos_log_writer=None,
                                                             checkpoint_set=checkpoint_set,
+                                                            files_log_writer=files_log_writer,
                                                             exclude_prefixes=exclude_prefixes)
 
                 for folder in folders:
                     dir_path = folder.get('path', None)
 
                     # if the current user is not in kept groups, skip this dir
-                    if self.groups_to_keep and self.is_user_ws_item(dir_path):
-                        dir_user = self.get_user(dir_path)
-                        user_groups = [group.get("display") for user in ws_users if
-                                       user.get("emails")[0].get("value") == dir_user for group in user.get("groups")]
-                        if not set(user_groups).intersection(set(self.groups_to_keep)):
-                            if self.is_verbose():
-                                logging.info("Skipped directory due to group exclusion: {0}".format(dir_path))
-                            continue
+                    if self.is_group_excluded(dir_path, ws_users):
+                        if self.is_verbose():
+                            logging.info("Skipped directory due to group exclusion: {0}".format(dir_path))
+                        continue
 
                     if not checkpoint_set.contains(dir_path) and not dir_path.startswith(tuple(exclude_prefixes)):
                         num_nbs_plus = _recurse_log_all_workspace_items(folder)
@@ -804,6 +934,8 @@ class WorkspaceClient(dbclient):
                 if 'error_code' in resp_upload:
                     resp_upload['path'] = nb_input_args['path']
                     logging_utils.log_response_error(error_logger, resp_upload)
+        # upload the non-notebook workspace files, e.g. csv / xlsx data files
+        self.import_all_workspace_files()
 
     def import_all_workspace_items(self, artifact_dir='artifacts/',
                                    archive_missing=False, num_parallel=4, last_session=""):
@@ -850,38 +982,9 @@ class WorkspaceClient(dbclient):
             '''
             Upload all files in parallel in root (current) directory.
             '''
-            # replace the local directory with empty string to get the notebook workspace directory
-            nb_dir = '/' + root.replace(src_dir, '')
-            upload_dir = nb_dir
-            if not nb_dir == '/':
-                upload_dir = nb_dir + '/'
-            if self.is_user_ws_item(upload_dir):
-                ws_user = self.get_user(upload_dir)
-                if archive_missing:
-                    if ws_user in archive_users:
-                        upload_dir = upload_dir.replace('Users', 'Archive', 1)
-                    elif not self.does_user_exist(ws_user):
-                        # add the user to the cache / set of missing users
-                        logging.info("User workspace does not exist, adding to archive cache: {0}".format(ws_user))
-                        archive_users.add(ws_user)
-                        # append the archive path to the upload directory
-                        upload_dir = upload_dir.replace('Users', 'Archive', 1)
-                    else:
-                        logging.info("User workspace exists: {0}".format(ws_user))
-                elif not self.does_user_exist(ws_user):
-                    logging.info("User {0} is missing. "
-                                 "Please re-run with --archive-missing flag "
-                                 "or first verify all users exist in the new workspace".format(ws_user))
-                    return
-                else:
-                    logging.info("Uploading for user: {0}".format(ws_user))
-            # make the top level folder before uploading files within the loop
-            if not self.is_user_ws_root(upload_dir):
-                # if it is not the /Users/example@example.com/ root path, don't create the folder
-                resp_mkdirs = self.post(WS_MKDIRS, {'path': upload_dir})
-                if 'error_code' in resp_mkdirs:
-                    resp_mkdirs['path'] = upload_dir
-                    logging_utils.log_response_error(error_logger, resp_mkdirs)
+            upload_dir = self.prepare_upload_dir(root, src_dir, error_logger, archive_missing, archive_users)
+            if upload_dir is None:
+                return
 
             def _file_upload_helper(f):
                 logging.info("Uploading: {0}".format(f))
@@ -909,6 +1012,109 @@ class WorkspaceClient(dbclient):
                     logging_utils.log_response_error(error_logger, resp_upload)
                 else:
                     checkpoint_notebook_set.write(ws_file_path)
+
+            with ThreadPoolExecutor(max_workers=num_parallel) as executor:
+                futures = [executor.submit(_file_upload_helper, file) for file in files]
+                concurrent.futures.wait(futures, return_when="FIRST_EXCEPTION")
+                propagate_exceptions(futures)
+
+        with ThreadPoolExecutor(max_workers=num_parallel) as executor:
+            futures = [executor.submit(_upload_all_files, walk[0], walk[1], walk[2]) for walk in self.walk(src_dir)]
+            concurrent.futures.wait(futures, return_when="FIRST_EXCEPTION")
+            propagate_exceptions(futures)
+
+    def prepare_upload_dir(self, root, src_dir, error_logger, archive_missing=False, archive_users=None):
+        """
+        Map a local artifact directory to the workspace directory it uploads into, and create that directory.
+        :param root: local directory currently being walked
+        :param src_dir: local root of the artifacts being imported
+        :param archive_missing: whether to put missing users into a /Archive/ top level directory
+        :param archive_users: shared cache of missing users already redirected to /Archive/
+        :return: the workspace directory to upload into, or None if this directory should be skipped
+        """
+        if archive_users is None:
+            archive_users = set()
+        # replace the local directory with empty string to get the workspace directory
+        ws_dir = '/' + root.replace(src_dir, '')
+        upload_dir = ws_dir
+        if not ws_dir == '/':
+            upload_dir = ws_dir + '/'
+        if self.is_user_ws_item(upload_dir):
+            ws_user = self.get_user(upload_dir)
+            if archive_missing:
+                if ws_user in archive_users:
+                    upload_dir = upload_dir.replace('Users', 'Archive', 1)
+                elif not self.does_user_exist(ws_user):
+                    # add the user to the cache / set of missing users
+                    logging.info("User workspace does not exist, adding to archive cache: {0}".format(ws_user))
+                    archive_users.add(ws_user)
+                    # append the archive path to the upload directory
+                    upload_dir = upload_dir.replace('Users', 'Archive', 1)
+                else:
+                    logging.info("User workspace exists: {0}".format(ws_user))
+            elif not self.does_user_exist(ws_user):
+                logging.info("User {0} is missing. "
+                             "Please re-run with --archive-missing flag "
+                             "or first verify all users exist in the new workspace".format(ws_user))
+                return None
+            else:
+                logging.info("Uploading for user: {0}".format(ws_user))
+        # make the top level folder before uploading files within the loop
+        if not self.is_user_ws_root(upload_dir):
+            # if it is not the /Users/example@example.com/ root path, don't create the folder
+            resp_mkdirs = self.post(WS_MKDIRS, {'path': upload_dir})
+            if 'error_code' in resp_mkdirs:
+                resp_mkdirs['path'] = upload_dir
+                logging_utils.log_response_error(error_logger, resp_mkdirs)
+        return upload_dir
+
+    def import_all_workspace_files(self, artifact_dir='file_artifacts/', archive_missing=False, num_parallel=4):
+        """
+        Import all non-notebook workspace files, e.g. csv / xlsx / json data files, into a new workspace.
+        Walks the entire file_artifacts/ directory in parallel and uploads each file with the AUTO format,
+        which is the only format that supports non-notebook workspace files.
+
+        :param artifact_dir: workspace file download directory
+        :param archive_missing: whether to put missing users into a /Archive/ top level directory
+        """
+        src_dir = self.get_export_dir() + artifact_dir
+        error_logger = logging_utils.get_error_logger(wmconstants.WM_IMPORT, wmconstants.WORKSPACE_FILE_OBJECT,
+                                                      self.get_export_dir())
+        if not os.path.isdir(src_dir):
+            # a workspace without any non-notebook files, or an export taken before files were supported
+            logging.info(f"No workspace files found at {src_dir}. Skipping workspace file import ...")
+            return
+        checkpoint_file_set = self._checkpoint_service.get_checkpoint_key_set(
+            wmconstants.WM_IMPORT, wmconstants.WORKSPACE_FILE_OBJECT)
+        archive_users = set()
+
+        def _upload_all_files(root, subdirs, files):
+            upload_dir = self.prepare_upload_dir(root, src_dir, error_logger, archive_missing, archive_users)
+            if upload_dir is None:
+                return
+
+            def _file_upload_helper(f):
+                logging.info("Uploading: {0}".format(f))
+                local_file_path = os.path.join(root, f)
+                # the workspace path of a file keeps its extension, unlike a notebook
+                ws_file_path = upload_dir + f
+                if checkpoint_file_set.contains(ws_file_path):
+                    return
+                with open(local_file_path, "rb") as fp:
+                    file_input_args = {
+                        "content": base64.encodebytes(fp.read()).decode('utf-8'),
+                        "path": ws_file_path,
+                        "format": "AUTO"
+                    }
+                if self.is_overwrite_notebooks():
+                    file_input_args['overwrite'] = True
+                resp_upload = self.post(WS_IMPORT, file_input_args)
+                if 'error_code' in resp_upload:
+                    resp_upload['path'] = ws_file_path
+                    logging.info(f'Error uploading file: {ws_file_path}')
+                    logging_utils.log_response_error(error_logger, resp_upload)
+                else:
+                    checkpoint_file_set.write(ws_file_path)
 
             with ThreadPoolExecutor(max_workers=num_parallel) as executor:
                 futures = [executor.submit(_file_upload_helper, file) for file in files]

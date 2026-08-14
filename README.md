@@ -278,12 +278,13 @@ Export full workspace artifacts from Databricks
 optional arguments:
   -h, --help            show this help message and exit
   --users               Download all the users and groups in the workspace
-  --workspace           Log all the notebook paths in the workspace. (metadata
-                        only)
+  --workspace           Log all the notebook and workspace file paths in the
+                        workspace. (metadata only)
   --notebook-format {DBC,SOURCE,HTML}
                         Choose the file format to download the notebooks
                         (default: DBC)
-  --download            Download all notebooks for the environment
+  --download            Download all notebooks and non-notebook workspace
+                        files for the environment
   --libs                Log all the libs for the environment
   --clusters            Log all the clusters for the environment
   --jobs                Log all the job configs for the environment
@@ -350,8 +351,8 @@ Import full workspace artifacts into Databricks
 optional arguments:
   -h, --help            show this help message and exit
   --users               Import all the users and groups from the logfile.
-  --workspace           Import all notebooks from export dir into the
-                        workspace.
+  --workspace           Import all notebooks and non-notebook workspace files
+                        from export dir into the workspace.
   --workspace-top-level
                         Import all top level notebooks from export dir into
                         the workspace. Excluding Users dirs
@@ -481,6 +482,20 @@ If users have left your organization, their artifacts (notebooks / job templates
 object no longer exists. During the migration, we can keep the old users notebooks into the top level 
 directory `/Archive/{username}@domain.com`
 Use the `--archive-missing` option to put these artifacts in the archive folder. 
+
+**Non-notebook workspace files**
+
+Workspaces can also contain files that are not notebooks, e.g. `csv`, `xlsx`, or `json` data files stored next to the
+notebooks that use them. These are covered by the same commands above:
+* `--workspace` logs their paths into `workspace_files.log`, next to `user_workspace.log` for notebooks.
+* `--download` downloads their contents into the `file_artifacts/` directory. They are stored separately from the
+  notebook `artifacts/` directory because they are always transferred with the `AUTO` format; the `--notebook-format`
+  option (`DBC` / `SOURCE` / `HTML`) only applies to notebooks.
+* `--workspace` on import uploads them back into the destination workspace, honouring `--archive-missing`.
+
+As with notebooks, the workspace export API cannot transfer an object larger than 10MB. Use `--skip-large-nb` to log
+and skip those instead of failing. In the migration pipeline, this step is the `workspace_files` task, which can be
+turned off with `--skip-tasks workspace_files`.
 
 **Single User Export/Import**  
 The tool supports exporting single user workspaces using the following command:

@@ -91,6 +91,9 @@ def main():
         # log notebooks and libraries
         num_notebooks = ws_c.download_notebooks(num_parallel=args.num_parallel)
         print(f"Total number of notebooks downloaded: {num_notebooks}")
+        # download the non-notebook workspace files, e.g. csv / xlsx data files
+        num_files = ws_c.download_workspace_files(num_parallel=args.num_parallel)
+        print(f"Total number of workspace files downloaded: {num_files}")
         end = timer()
         print("Complete Workspace Download Time: " + str(timedelta(seconds=end - start)))
 

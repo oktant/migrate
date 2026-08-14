@@ -145,6 +145,22 @@ class NotebookExportTask(AbstractTask):
         print(f"Total number of notebooks downloaded: {num_notebooks}")
 
 
+class WorkspaceFileExportTask(AbstractTask):
+    """Task that downloads all non-notebook workspace files, e.g. csv / xlsx data files.
+
+    Depends on the workspace item log, which records the file paths under workspace_files.log.
+    """
+    def __init__(self, client_config, checkpoint_service, skip=False):
+        super().__init__("export_workspace_files", wmconstants.WM_EXPORT, wmconstants.WORKSPACE_FILE_OBJECT, skip)
+        self.client_config = client_config
+        self.checkpoint_service = checkpoint_service
+
+    def run(self):
+        ws_c = WorkspaceClient(self.client_config, self.checkpoint_service)
+        num_files = ws_c.download_workspace_files(num_parallel=self.client_config["num_parallel"])
+        print(f"Total number of workspace files downloaded: {num_files}")
+
+
 class WorkspaceACLImportTask(AbstractTask):
     """Task that import ACLs of all notebooks and directories.
 
@@ -185,6 +201,20 @@ class NotebookImportTask(AbstractTask):
                                         num_parallel=self.client_config["num_parallel"],
                                         last_session=self.args.last_session)
         ws_c.import_all_repos(num_parallel=self.client_config["num_parallel"])
+
+
+class WorkspaceFileImportTask(AbstractTask):
+    """Task that imports all non-notebook workspace files, e.g. csv / xlsx data files."""
+    def __init__(self, client_config, checkpoint_service, args, skip=False):
+        super().__init__("import_workspace_files", wmconstants.WM_IMPORT, wmconstants.WORKSPACE_FILE_OBJECT, skip)
+        self.client_config = client_config
+        self.checkpoint_service = checkpoint_service
+        self.args = args
+
+    def run(self):
+        ws_c = WorkspaceClient(self.client_config, self.checkpoint_service)
+        ws_c.import_all_workspace_files(archive_missing=self.args.archive_missing,
+                                        num_parallel=self.client_config["num_parallel"])
 
 
 class ClustersExportTask(AbstractTask):
