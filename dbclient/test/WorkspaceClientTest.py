@@ -117,5 +117,57 @@ class TestWorkspaceFiles(unittest.TestCase):
             ws_c.post.assert_not_called()
 
 
+class TestExcludedPaths(unittest.TestCase):
+    # the home directory of a service principal, which is named after its application id
+    SP_HOME_PATTERN = r'^/Users/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/'
+
+    def test_is_excluded_path(self):
+        patterns = WorkspaceClient.compile_exclude_patterns([self.SP_HOME_PATTERN])
+
+        self.assertTrue(WorkspaceClient.is_excluded_path(
+            '/Users/8a1b3c4d-1111-2222-3333-444455556666/nb', exclude_patterns=patterns))
+        self.assertFalse(WorkspaceClient.is_excluded_path(
+            '/Users/foo@db.com/nb', exclude_patterns=patterns))
+        # prefixes and patterns are both honoured, and no exclusion means nothing is skipped
+        self.assertTrue(WorkspaceClient.is_excluded_path('/Shared/tmp/nb', exclude_prefixes=['/Shared/tmp']))
+        self.assertFalse(WorkspaceClient.is_excluded_path('/Shared/tmp/nb'))
+
+    def test_log_all_workspace_items_skips_matching_folders(self):
+        listings = {
+            '/Users': {'objects': [
+                {'path': '/Users/foo@db.com', 'object_type': 'DIRECTORY', 'object_id': 1},
+                {'path': '/Users/8a1b3c4d-1111-2222-3333-444455556666', 'object_type': 'DIRECTORY', 'object_id': 2}
+            ]},
+            '/Users/foo@db.com': {'objects': [
+                {'path': '/Users/foo@db.com/nb', 'object_type': 'NOTEBOOK', 'object_id': 3},
+                {'path': '/Users/foo@db.com/sales.csv', 'object_type': 'FILE', 'object_id': 4}
+            ]},
+            '/Users/8a1b3c4d-1111-2222-3333-444455556666': {'objects': [
+                {'path': '/Users/8a1b3c4d-1111-2222-3333-444455556666/sp_nb', 'object_type': 'NOTEBOOK',
+                 'object_id': 5},
+                {'path': '/Users/8a1b3c4d-1111-2222-3333-444455556666/sp.csv', 'object_type': 'FILE', 'object_id': 6}
+            ]}
+        }
+        with tempfile.TemporaryDirectory() as export_dir:
+            export_dir += '/'
+            ws_c = build_client(export_dir)
+            ws_c.get = MagicMock(side_effect=lambda endpoint, args=None: listings.get(
+                (args or {}).get('path'), {}))
+
+            num_nbs = ws_c.log_all_workspace_items_entry(ws_path='/Users',
+                                                         exclude_patterns=[self.SP_HOME_PATTERN])
+
+            # only the notebook of the real user is logged, the service principal home is never listed
+            self.assertEqual(num_nbs, 1)
+            listed_paths = [call[0][1].get('path') for call in ws_c.get.call_args_list if len(call[0]) > 1]
+            self.assertNotIn('/Users/8a1b3c4d-1111-2222-3333-444455556666', listed_paths)
+            with open(export_dir + 'user_workspace.log') as fp:
+                self.assertEqual([json.loads(line).get('path') for line in fp], ['/Users/foo@db.com/nb'])
+            with open(export_dir + 'workspace_files.log') as fp:
+                self.assertEqual([json.loads(line).get('path') for line in fp], ['/Users/foo@db.com/sales.csv'])
+            with open(export_dir + 'user_dirs.log') as fp:
+                self.assertEqual([json.loads(line).get('path') for line in fp], ['/Users/foo@db.com'])
+
+
 if __name__ == '__main__':
     unittest.main()

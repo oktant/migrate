@@ -1,6 +1,7 @@
 import argparse
 from datetime import datetime, timedelta
 import configparser
+import re
 import wmconstants
 from enum import Enum
 from os import path
@@ -29,6 +30,19 @@ class ValidateSkipTasks(argparse.Action):
             if task not in valid_tasks:
                 raise ValueError(f"invalid task {task}. Skipped tasks must come from {valid_tasks}.")
         setattr(args, self.dest, values)
+
+
+def valid_regex(s):
+    """
+    Validates a workspace path exclusion pattern while parsing arguments, so that a malformed
+    regex fails immediately instead of halfway through an export.
+    """
+    try:
+        re.compile(s)
+    except re.error as e:
+        msg = "not a valid regular expression: {0!r}. {1}".format(s, e)
+        raise argparse.ArgumentTypeError(msg)
+    return s
 
 
 def valid_date(s):
@@ -232,6 +246,13 @@ def get_export_parser():
 
     parser.add_argument('--exclude-work-item-prefixes', nargs='+', type=str, default=[],
                         help='List of prefixes to skip export for log_all_workspace_items')
+
+    parser.add_argument('--exclude-work-item-patterns', nargs='+', type=valid_regex, default=[],
+                        help='List of regular expressions matched against workspace paths to skip export for '
+                             'log_all_workspace_items. A matching directory is skipped together with everything '
+                             'below it. Use this when the path to exclude is not a fixed prefix, e.g. '
+                             r'--exclude-work-item-patterns "^/Users/[0-9a-fA-F-]{36}/" '
+                             'to skip the home directories of service principals')
     
     parser.add_argument('--timeout', type=float, default=300.0,
                         help='Timeout for the calls to Databricks\' REST API, in seconds, defaults to 300.0 --use float e.g. 100.0 to make it bigger')
@@ -564,6 +585,13 @@ def get_pipeline_parser() -> argparse.ArgumentParser:
 
     parser.add_argument('--exclude-work-item-prefixes', nargs='+', type=str, default=[],
                         help='List of prefixes to skip export for log_all_workspace_items')
+
+    parser.add_argument('--exclude-work-item-patterns', nargs='+', type=valid_regex, default=[],
+                        help='List of regular expressions matched against workspace paths to skip export for '
+                             'log_all_workspace_items. A matching directory is skipped together with everything '
+                             'below it. Use this when the path to exclude is not a fixed prefix, e.g. '
+                             r'--exclude-work-item-patterns "^/Users/[0-9a-fA-F-]{36}/" '
+                             'to skip the home directories of service principals')
 
     parser.add_argument('--groups-to-keep', nargs='+', type=str, default=[],
                         help='List of groups (and therefore users/notebooks) to keep if specified')
