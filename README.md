@@ -1,5 +1,9 @@
 # Databricks Migration Tool
 
+> **This is a fork of [databrickslabs/migrate](https://github.com/databrickslabs/migrate).** It tracks the upstream
+> project and adds the changes listed under [Fork Changes](#fork-changes). Everything else in this README describes
+> upstream behaviour and applies unchanged.
+
 > **NOTE:** For a more extensive and maintained cross-workload migration solution, please use the [Databricks Terraform Exporter](https://registry.terraform.io/providers/databricks/databricks/latest/docs/guides/experimental-exporter), which creates Infrastructure-as-a-Code replicas for the entire manually-configured Databricks Workspaces.
 
 This is a migration package to log all Databricks resources for backup and/or migrating to another Databricks workspace.
@@ -15,6 +19,7 @@ This package also uses credentials from the
 [Databricks CLI](https://docs.databricks.com/user-guide/dev-tools/databricks-cli.html).
 
 ## Table of Contents
+- [Fork Changes](#fork-changes)
 - [Pre-Requisites](#pre-requisites)
 - [Setup](#setup)
 - [Migration Components](#migration-components)
@@ -26,6 +31,20 @@ This package also uses credentials from the
   - [Importing the Workspace](#importing-the-workspace)
   - [Validation](#validation)
 - [Limitations](#limitations)
+
+## Fork Changes
+
+Changes in this fork relative to [databrickslabs/migrate](https://github.com/databrickslabs/migrate):
+
+**Migration of non-notebook workspace files.** Upstream exports notebooks only, so `csv` / `xlsx` / `json` files
+checked into the workspace next to the notebooks that read them were silently left behind. They are now logged,
+downloaded, and imported alongside notebooks by the existing `--workspace` and `--download` flags, and by the
+`workspace_files` pipeline task. See [Non-notebook workspace files](#notebooks) for details.
+
+**Exclusion of workspace paths by regular expression.** Upstream can only exclude workspace paths by fixed prefix
+(`--exclude-work-item-prefixes`). The new `--exclude-work-item-patterns` accepts regular expressions, which is what
+allows a *variable* path segment to be excluded — most usefully the home directory of every service principal, whose
+name is a per-principal application id. See [Excluding workspace paths](#notebooks) for details.
 
 ## Pre-Requisites
 To use this migration tool, you'll need:  
@@ -130,6 +149,7 @@ usage: migration_pipeline.py [-h] [--profile PROFILE] [--azure or gcp] [--silent
                              [--use-checkpoint] [--skip-tasks SKIP_TASKS [SKIP_TASKS ...]] [--num-parallel NUM_PARALLEL] [--retry-total RETRY_TOTAL]
                              [--retry-backoff RETRY_BACKOFF] [--start-date START_DATE] [--hipaa] [--skip-large-nb]
                              [--exclude-work-item-prefixes EXCLUDE_WORK_ITEM_PREFIXES [EXCLUDE_WORK_ITEM_PREFIXES ...]]
+                             [--exclude-work-item-patterns EXCLUDE_WORK_ITEM_PATTERNS [EXCLUDE_WORK_ITEM_PATTERNS ...]]
 
 Export user(s) workspace artifacts from Databricks
 
@@ -165,8 +185,9 @@ optional arguments for import/export pipeline:
   --use-checkpoint      use checkpointing to restart from previous state
   --skip-tasks SKIP_TASK [SKIP_TASK ...]
                         Space-separated list of tasks to skip from the pipeline. Valid options are:
-                         instance_profiles, users, groups, workspace_item_log, workspace_acls, notebooks, secrets,
-                         clusters, instance_pools, jobs, metastore, metastore_table_acls, mlflow_experiments, mlflow_runs
+                         instance_profiles, users, groups, workspace_item_log, workspace_acls, notebooks,
+                         workspace_files, secrets, clusters, instance_pools, jobs, metastore, metastore_table_acls,
+                         mlflow_experiments, mlflow_runs
   --keep-tasks KEEP_TASK [KEEP_TASK ...]
                         Space-separated list of tasks to run from the pipeline. See valid options in --skip-tasks. Overrides skip-tasks.
   --num-parallel NUM_PARALLEL
@@ -179,6 +200,14 @@ optional arguments for import/export pipeline:
                         start-date format: YYYY-MM-DD. If not provided, defaults to past 30 days. Currently, only used for exporting ML runs objects.
   --groups-to-keep group [group ...]
                         List of groups to keep if selectively exporting assets. Only users (and their assets) belonging to these groups will be exported.
+  --exclude-work-item-prefixes EXCLUDE_WORK_ITEM_PREFIXES [EXCLUDE_WORK_ITEM_PREFIXES ...]
+                        List of prefixes to skip export for log_all_workspace_items
+  --exclude-work-item-patterns EXCLUDE_WORK_ITEM_PATTERNS [EXCLUDE_WORK_ITEM_PATTERNS ...]
+                        List of regular expressions matched against workspace paths to skip export for
+                        log_all_workspace_items. A matching directory is skipped together with everything below it.
+                        Use this when the path to exclude is not a fixed prefix, e.g.
+                        --exclude-work-item-patterns "^/Users/[0-9a-fA-F-]{36}/" to skip the home directories of
+                        service principals
                         
 options for validation pipeline:
   --validate-pipeline   Validate exported data between source and destination.
@@ -271,6 +300,8 @@ usage: export_db.py [-h] [--users] [--workspace]
                     [--old-account-id OLD_ACCOUNT_ID]
                     [--replace-old-email REPLACE_OLD_EMAIL]
                     [--update-new-email UPDATE_NEW_EMAIL]
+                    [--exclude-work-item-prefixes EXCLUDE_WORK_ITEM_PREFIXES [EXCLUDE_WORK_ITEM_PREFIXES ...]]
+                    [--exclude-work-item-patterns EXCLUDE_WORK_ITEM_PATTERNS [EXCLUDE_WORK_ITEM_PATTERNS ...]]
                     [--bypass-windows-check]
                     
 Export full workspace artifacts from Databricks
@@ -329,6 +360,17 @@ optional arguments:
                         Old email address to update from logs
   --update-new-email UPDATE_NEW_EMAIL
                         New email address to replace the logs
+  --exclude-work-item-prefixes EXCLUDE_WORK_ITEM_PREFIXES [EXCLUDE_WORK_ITEM_PREFIXES ...]
+                        List of prefixes to skip export for
+                        log_all_workspace_items
+  --exclude-work-item-patterns EXCLUDE_WORK_ITEM_PATTERNS [EXCLUDE_WORK_ITEM_PATTERNS ...]
+                        List of regular expressions matched against workspace
+                        paths to skip export for log_all_workspace_items. A
+                        matching directory is skipped together with everything
+                        below it. Use this when the path to exclude is not a
+                        fixed prefix, e.g. --exclude-work-item-patterns
+                        "^/Users/[0-9a-fA-F-]{36}/" to skip the home
+                        directories of service principals
 ```
 
 #### Import Help Text
@@ -496,6 +538,28 @@ notebooks that use them. These are covered by the same commands above:
 As with notebooks, the workspace export API cannot transfer an object larger than 10MB. Use `--skip-large-nb` to log
 and skip those instead of failing. In the migration pipeline, this step is the `workspace_files` task, which can be
 turned off with `--skip-tasks workspace_files`.
+
+**Excluding workspace paths**
+
+Parts of the workspace can be left out of the export with two options, both of which apply while the workspace is
+being listed, so an excluded directory is skipped together with everything below it and is never even listed:
+* `--exclude-work-item-prefixes` skips paths starting with any of the given fixed prefixes.
+* `--exclude-work-item-patterns` skips paths matching any of the given regular expressions. Patterns are matched
+  anywhere in the path, so anchor them with `^` if you mean a prefix. A malformed pattern is rejected while parsing
+  arguments, rather than halfway through an export.
+
+Use the pattern form when the path to exclude contains a segment that varies. The common case is the home directory of
+a service principal, which is named after its application id and therefore differs for every principal:
+
+```bash
+# skip the home directory of every service principal, and everything under /Shared/tmp
+python export_db.py --profile DEMO --workspace \
+  --exclude-work-item-patterns "^/Users/[0-9a-fA-F-]{36}/" \
+  --exclude-work-item-prefixes /Shared/tmp
+```
+
+Both options take a space-separated list, apply to notebooks, libraries, workspace files, directories, and repos
+alike, and are accepted by `export_db.py` as well as `migration_pipeline.py`.
 
 **Single User Export/Import**  
 The tool supports exporting single user workspaces using the following command:

@@ -107,7 +107,9 @@ class WorkspaceItemLogExportTask(AbstractTask):
         ws_c = WorkspaceClient(self.client_config, self.checkpoint_service)
         # log notebooks and libraries
         ws_c.init_workspace_logfiles()
-        num_notebooks = ws_c.log_all_workspace_items_entry(exclude_prefixes=self.args.exclude_work_item_prefixes)
+        num_notebooks = ws_c.log_all_workspace_items_entry(
+            exclude_prefixes=self.args.exclude_work_item_prefixes,
+            exclude_patterns=self.args.exclude_work_item_patterns)
         print("Total number of notebooks logged: ", num_notebooks)
 
 

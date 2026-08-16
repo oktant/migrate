@@ -514,8 +514,10 @@ class WorkspaceClient(dbclient):
             if os.path.exists(workspace_files_log):
                 os.remove(workspace_files_log)
 
-    def log_all_workspace_items_entry(self, ws_path='/', workspace_log_file='user_workspace.log', libs_log_file='libraries.log', dir_log_file='user_dirs.log', repos_log_file='repos.log', files_log_file='workspace_files.log', exclude_prefixes=[]):
+    def log_all_workspace_items_entry(self, ws_path='/', workspace_log_file='user_workspace.log', libs_log_file='libraries.log', dir_log_file='user_dirs.log', repos_log_file='repos.log', files_log_file='workspace_files.log', exclude_prefixes=[], exclude_patterns=[]):
         logging.info(f"Skip all paths with the following prefixes: {exclude_prefixes}")
+        logging.info(f"Skip all paths matching the following patterns: {exclude_patterns}")
+        exclude_patterns = self.compile_exclude_patterns(exclude_patterns)
 
         workspace_log_writer = ThreadSafeWriter(self.get_export_dir() + workspace_log_file, "a")
         libs_log_writer = ThreadSafeWriter(self.get_export_dir() + libs_log_file, "a")
@@ -533,7 +535,8 @@ class WorkspaceClient(dbclient):
                                                    repos_log_writer=repos_log_writer,
                                                    checkpoint_set=checkpoint_item_log_set,
                                                    files_log_writer=files_log_writer,
-                                                   exclude_prefixes=exclude_prefixes)
+                                                   exclude_prefixes=exclude_prefixes,
+                                                   exclude_patterns=exclude_patterns)
         finally:
             workspace_log_writer.close()
             libs_log_writer.close()
@@ -558,7 +561,31 @@ class WorkspaceClient(dbclient):
                        if user.get("emails")[0].get("value") == item_user for group in user.get("groups")]
         return not set(user_groups).intersection(set(self.groups_to_keep))
 
-    def log_all_workspace_items(self, ws_path, workspace_log_writer, libs_log_writer, dir_log_writer, repos_log_writer, checkpoint_set, files_log_writer=None, exclude_prefixes=[]):
+    @staticmethod
+    def compile_exclude_patterns(exclude_patterns):
+        """
+        Compile the workspace path exclusion patterns once, instead of on every listed item.
+        Already compiled patterns are passed through, so the recursion can hand them down unchanged.
+        :param exclude_patterns: iterable of regex strings, or compiled patterns
+        :return: list of compiled patterns
+        """
+        return [pattern if hasattr(pattern, 'search') else re.compile(pattern) for pattern in exclude_patterns]
+
+    @staticmethod
+    def is_excluded_path(ws_path, exclude_prefixes=[], exclude_patterns=[]):
+        """
+        Checks a workspace path against the exclusions provided by --exclude-work-item-prefixes and
+        --exclude-work-item-patterns. Patterns are regexes matched anywhere in the path, which is what
+        allows a variable path segment to be excluded, e.g. '^/Users/[0-9a-fA-F-]{36}/' for the home
+        directory of every service principal.
+        :param ws_path: workspace path of the item
+        :return: True if the item should be skipped
+        """
+        if exclude_prefixes and ws_path.startswith(tuple(exclude_prefixes)):
+            return True
+        return any(pattern.search(ws_path) for pattern in exclude_patterns)
+
+    def log_all_workspace_items(self, ws_path, workspace_log_writer, libs_log_writer, dir_log_writer, repos_log_writer, checkpoint_set, files_log_writer=None, exclude_prefixes=[], exclude_patterns=[]):
         """
         Loop and log all workspace items to download them at a later time
         :param ws_path: root path to log all the items of the notebook workspace
@@ -566,8 +593,11 @@ class WorkspaceClient(dbclient):
         :param libs_log_file: library logfile to store workspace libraries
         :param dir_log_file: log directory for users
         :param files_log_writer: logfile to store all the paths of the non-notebook workspace files
+        :param exclude_prefixes: workspace paths starting with any of these prefixes are skipped
+        :param exclude_patterns: workspace paths matching any of these regexes are skipped
         :return:
         """
+        exclude_patterns = self.compile_exclude_patterns(exclude_patterns)
         # define log file names for notebooks, folders, and libraries
         if ws_path == '/':
             # default is the root path
@@ -602,7 +632,13 @@ class WorkspaceClient(dbclient):
                         logging.info("Skipped notebook path due to group exclusion: {0}".format(x.get('path')))
                     continue
 
-                if not checkpoint_set.contains(nb_path) and not nb_path.startswith(tuple(exclude_prefixes)):
+                # skip notebooks under an excluded path, e.g. the home directory of a service principal
+                if self.is_excluded_path(nb_path, exclude_prefixes, exclude_patterns):
+                    if self.is_verbose():
+                        logging.info("Skipped notebook path due to path exclusion: {0}".format(nb_path))
+                    continue
+
+                if not checkpoint_set.contains(nb_path):
                     if self.is_verbose():
                         logging.info("Saving path: {0}".format(x.get('path')))
                     workspace_log_writer.write(json.dumps(x) + '\n')
@@ -617,7 +653,12 @@ class WorkspaceClient(dbclient):
                         logging.info("Skipped library path due to group exclusion: {0}".format(lib_path))
                     continue
 
-                if not checkpoint_set.contains(lib_path) and not lib_path.startswith(tuple(exclude_prefixes)):
+                if self.is_excluded_path(lib_path, exclude_prefixes, exclude_patterns):
+                    if self.is_verbose():
+                        logging.info("Skipped library path due to path exclusion: {0}".format(lib_path))
+                    continue
+
+                if not checkpoint_set.contains(lib_path):
                     libs_log_writer.write(json.dumps(y) + '\n')
                     checkpoint_set.write(lib_path)
             if files_log_writer:
@@ -630,7 +671,12 @@ class WorkspaceClient(dbclient):
                             logging.info("Skipped workspace file path due to group exclusion: {0}".format(file_path))
                         continue
 
-                    if not checkpoint_set.contains(file_path) and not file_path.startswith(tuple(exclude_prefixes)):
+                    if self.is_excluded_path(file_path, exclude_prefixes, exclude_patterns):
+                        if self.is_verbose():
+                            logging.info("Skipped workspace file path due to path exclusion: {0}".format(file_path))
+                        continue
+
+                    if not checkpoint_set.contains(file_path):
                         if self.is_verbose():
                             logging.info("Saving workspace file path: {0}".format(file_path))
                         files_log_writer.write(json.dumps(f) + '\n')
@@ -648,7 +694,8 @@ class WorkspaceClient(dbclient):
                                                             repos_log_writer=None,
                                                             checkpoint_set=checkpoint_set,
                                                             files_log_writer=files_log_writer,
-                                                            exclude_prefixes=exclude_prefixes)
+                                                            exclude_prefixes=exclude_prefixes,
+                                                            exclude_patterns=exclude_patterns)
 
                 for folder in folders:
                     dir_path = folder.get('path', None)
@@ -659,7 +706,12 @@ class WorkspaceClient(dbclient):
                             logging.info("Skipped directory due to group exclusion: {0}".format(dir_path))
                         continue
 
-                    if not checkpoint_set.contains(dir_path) and not dir_path.startswith(tuple(exclude_prefixes)):
+                    # an excluded directory is skipped together with everything below it, since we never recurse into it
+                    if self.is_excluded_path(dir_path, exclude_prefixes, exclude_patterns):
+                        logging.info("Skipped directory due to path exclusion: {0}".format(dir_path))
+                        continue
+
+                    if not checkpoint_set.contains(dir_path):
                         num_nbs_plus = _recurse_log_all_workspace_items(folder)
                         checkpoint_set.write(dir_path)
                         if num_nbs_plus:
@@ -668,7 +720,10 @@ class WorkspaceClient(dbclient):
         if repos_log_writer and repos:
             for repo in repos:
                 repo_path = repo.get('path', "")
-                if not checkpoint_set.contains(repo_path) and not repo_path.startswith(tuple(exclude_prefixes)):
+                if self.is_excluded_path(repo_path, exclude_prefixes, exclude_patterns):
+                    logging.info("Skipped repo due to path exclusion: {0}".format(repo_path))
+                    continue
+                if not checkpoint_set.contains(repo_path):
                     repos_log_writer.write(json.dumps(repo) + '\n')
                     checkpoint_set.write(repo_path)
 
