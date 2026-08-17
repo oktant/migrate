@@ -1,0 +1,289 @@
+# Scheduled full export of a Databricks workspace, published as an Azure DevOps
+# pipeline artifact.
+#
+# ---------------------------------------------------------------------------
+# One-time setup
+# ---------------------------------------------------------------------------
+# 1. Credentials. The pipeline reads two environment variables from the agent's
+#    environment:
+#      DATABRICKS_HOST   e.g. https://adb-1234567890123456.7.azuredatabricks.net
+#      DATABRICKS_TOKEN  a PAT for a workspace *admin*
+#    Set them on the self-hosted agent — for a systemd agent service, an
+#    Environment= line or an EnvironmentFile= in the unit; for the interactive
+#    runner, export them in the shell that starts `run.sh` — then restart the
+#    agent so it picks them up.
+#
+#    Because these arrive as plain environment variables rather than as an Azure
+#    DevOps secret variable, Azure DevOps does not know the token is a secret and
+#    will not mask it in logs on its own. The "Register credentials" step below
+#    registers it as a secret at the start of every run so that any later
+#    accidental echo is masked. Anyone able to queue a run of this pipeline, or
+#    to run any other pipeline on the same agent, can read the token — scope the
+#    pool and the PAT accordingly.
+#
+# 2. Agent. This runs on a self-hosted Linux agent so the export can exceed the
+#    6h hosted-agent job limit and so `exportRoot` persists between runs, which
+#    is what makes `--use-checkpoint` able to resume a failed export. The agent
+#    user needs python3, python3-venv, git, and write access to `exportRoot`.
+#
+# 3. Retention. Pipeline artifacts are deleted when their run is purged, so the
+#    pipeline's retention policy *is* the backup retention. Set it deliberately
+#    under Pipeline > Settings > Retention (the project default is 30 days).
+#    Snapshots you need to keep for longer should be pinned via "Retain"
+#    on the individual run, or moved to blob storage instead.
+#
+# 4. Metastore export. `metastore` and `metastore_table_acls` run SQL on a
+#    cluster, so `metastoreCluster` must name a cluster the token can start.
+#    Leave it blank and add both tasks to `skipTasks` to export only workspace
+#    objects (much faster, no compute cost).
+#
+# 5. Enabling. This pipeline is disabled by default — the `schedules` block
+#    below is commented out, so nothing runs until someone queues it manually.
+#    Once a manual run has proved the credentials, the agent and the export
+#    itself, uncomment that block to start the nightly export.
+
+name: dbx-export-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+pr: none
+
+# Disabled by default. With no `schedules` block registered, this pipeline runs
+# only when someone queues it by hand (Run pipeline), which is also how you give
+# it a first supervised trial. Uncomment the block below to turn on the nightly
+# export; see setup note 5.
+#
+# schedules:
+#   - cron: '0 1 * * *'
+#     displayName: Nightly full workspace export (01:00 UTC)
+#     branches:
+#       include:
+#         - main
+#     always: 'true'
+
+parameters:
+  - name: session
+    displayName: 'Resume session id (blank starts a new export)'
+    type: string
+    default: ' '
+  - name: skipTasks
+    displayName: 'Tasks to skip (space separated, blank exports everything)'
+    type: string
+    default: ' '
+
+variables:
+  - name: agentPool
+    value: 'linux-selfhosted'
+  # Persistent, outside the agent workspace, so checkpoints survive a re-run.
+  - name: exportRoot
+    value: '/var/opt/databricks-migrate'
+  # Cluster used for the hive metastore tasks; blank disables --cluster-name.
+  - name: metastoreCluster
+    value: ''
+  - name: numParallel
+    value: '4'
+  # Regexes for workspace paths to leave out. The default drops the home
+  # directory of every service principal, whose name is a per-principal
+  # application id and so cannot be matched by a fixed prefix.
+  - name: excludeWorkItemPatterns
+    value: '^/Users/[0-9a-fA-F-]{36}/'
+  # How many past session directories to keep on the agent's disk.
+  - name: keepSessionDays
+    value: '7'
+  - name: venvPath
+    value: '$(Agent.TempDirectory)/venv'
+  # HOME override for the export: .databrickscfg is the only way this tool
+  # accepts credentials, and this keeps the token out of the agent user's real
+  # home directory, where it would outlive the run.
+  - name: dbxHome
+    value: '$(Agent.TempDirectory)/dbx-home'
+
+pool:
+  name: $(agentPool)
+  demands:
+    - agent.os -equals Linux
+
+jobs:
+  - job: export
+    displayName: Export workspace
+    timeoutInMinutes: '0'
+    cancelTimeoutInMinutes: '10'
+
+    steps:
+      - checkout: self
+        fetchDepth: '1'
+        clean: 'true'
+
+      - script: |
+          set -euo pipefail
+          python3 -m venv "$VENV"
+          "$VENV/bin/pip" install --disable-pip-version-check --quiet --upgrade pip
+          "$VENV/bin/pip" install --disable-pip-version-check --quiet -e .
+          "$VENV/bin/python" -c 'import sys; print(sys.version)'
+        displayName: Install migration tool
+        env:
+          VENV: $(venvPath)
+
+      - script: |
+          set -euo pipefail
+          missing=0
+          if [ -z "${DATABRICKS_HOST:-}" ]; then
+            echo "##vso[task.logissue type=error]DATABRICKS_HOST is not set in the agent environment"
+            missing=1
+          fi
+          if [ -z "${DATABRICKS_TOKEN:-}" ]; then
+            echo "##vso[task.logissue type=error]DATABRICKS_TOKEN is not set in the agent environment"
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo "See the setup notes at the top of azure-pipelines.yml."
+            exit 1
+          fi
+          # Azure DevOps masks only the values it has been told are secret. These
+          # arrive as ordinary environment variables, so register the token now;
+          # it is masked in the log from here to the end of the job.
+          echo "##vso[task.setvariable variable=databricksToken;issecret=true]$DATABRICKS_TOKEN"
+          echo "Exporting from workspace $DATABRICKS_HOST"
+        displayName: Register credentials
+
+      - script: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$HOME"
+          printf '[DEFAULT]\nhost = %s\ntoken = %s\n' "$DATABRICKS_HOST" "$DATABRICKS_TOKEN" \
+            > "$HOME/.databrickscfg"
+          chmod 600 "$HOME/.databrickscfg"
+        displayName: Write Databricks credentials
+        env:
+          # DATABRICKS_HOST and DATABRICKS_TOKEN are inherited from the agent
+          # environment; only HOME is overridden, to keep the written
+          # .databrickscfg inside this run's temp directory.
+          HOME: $(dbxHome)
+
+      - script: |
+          set -euo pipefail
+          # test_connection.py exits 0 even for a rejected token, so assert on
+          # its output rather than its exit code.
+          "$VENV/bin/python" test_connection.py --azure | tee "$AGENT_TEMPDIRECTORY/conn.txt"
+          grep -q 'Connection successful!' "$AGENT_TEMPDIRECTORY/conn.txt"
+        displayName: Verify workspace connectivity
+        env:
+          HOME: $(dbxHome)
+          VENV: $(venvPath)
+
+      - script: |
+          set -euo pipefail
+          SESSION="${RESUME_SESSION// /}"
+          if [ -z "$SESSION" ]; then
+            # BUILD_BUILDNUMBER is dbx-export-20260817.1 -> session M20260817.1
+            SESSION="M${BUILD_BUILDNUMBER##*-}"
+            echo "Starting a new export session: $SESSION"
+          else
+            echo "Resuming export session: $SESSION"
+          fi
+          mkdir -p "$EXPORT_ROOT"
+          echo "##vso[task.setvariable variable=sessionId]$SESSION"
+        displayName: Resolve session id
+        env:
+          RESUME_SESSION: '${{ parameters.session }}'
+          EXPORT_ROOT: $(exportRoot)
+
+      - script: |
+          set -euo pipefail
+          ARGS=(--azure --export-pipeline --use-checkpoint --no-prompt
+                --session "$SESSION"
+                --set-export-dir "$EXPORT_ROOT"
+                --num-parallel "$NUM_PARALLEL"
+                --notebook-format DBC
+                --skip-large-nb)
+
+          if [ -n "${METASTORE_CLUSTER// /}" ]; then
+            ARGS+=(--cluster-name "$METASTORE_CLUSTER")
+          fi
+          # Unquoted on purpose: both variables are space-separated lists.
+          if [ -n "${SKIP_TASKS// /}" ]; then
+            ARGS+=(--skip-tasks $SKIP_TASKS)
+          fi
+          if [ -n "${EXCLUDE_PATTERNS// /}" ]; then
+            ARGS+=(--exclude-work-item-patterns $EXCLUDE_PATTERNS)
+          fi
+
+          echo "migration_pipeline.py ${ARGS[*]}"
+          "$VENV/bin/python" migration_pipeline.py "${ARGS[@]}"
+        displayName: Run export pipeline
+        env:
+          HOME: $(dbxHome)
+          VENV: $(venvPath)
+          SESSION: $(sessionId)
+          EXPORT_ROOT: $(exportRoot)
+          NUM_PARALLEL: $(numParallel)
+          METASTORE_CLUSTER: $(metastoreCluster)
+          SKIP_TASKS: '${{ parameters.skipTasks }}'
+          EXCLUDE_PATTERNS: $(excludeWorkItemPatterns)
+
+      - script: |
+          set -euo pipefail
+          # Per-object failures are logged to app_logs/failed_export_*.log and do
+          # not necessarily fail the pipeline, so surface them on the run.
+          FAILED="$AGENT_TEMPDIRECTORY/failed-logs.txt"
+          : > "$FAILED"
+          find "$EXPORT_ROOT/$SESSION/app_logs" -name 'failed_export_*.log' -size +0c \
+            > "$FAILED" 2>/dev/null || true
+          if [ -s "$FAILED" ]; then
+            echo "##vso[task.logissue type=warning]Export finished with per-object failures:"
+            while read -r f; do
+              echo "##vso[task.logissue type=warning]  ${f##*/}"
+              head -n 20 "$f"
+            done < "$FAILED"
+            echo "##vso[task.complete result=SucceededWithIssues;]"
+          else
+            echo "No failed_export_*.log files with content."
+          fi
+        displayName: Report per-object export failures
+        condition: and(succeededOrFailed(), ne(variables['sessionId'], ''))
+        env:
+          SESSION: $(sessionId)
+          EXPORT_ROOT: $(exportRoot)
+
+      - script: |
+          set -euo pipefail
+          # One tarball rather than tens of thousands of loose notebook files:
+          # artifact upload is dominated by per-file overhead.
+          mkdir -p "$STAGING"
+          tar -czf "$STAGING/databricks-export-$SESSION.tar.gz" -C "$EXPORT_ROOT" "$SESSION"
+          ls -lh "$STAGING"
+          du -sh "$EXPORT_ROOT/$SESSION"
+        displayName: Package snapshot
+        condition: and(succeededOrFailed(), ne(variables['sessionId'], ''))
+        env:
+          SESSION: $(sessionId)
+          EXPORT_ROOT: $(exportRoot)
+          STAGING: $(Build.ArtifactStagingDirectory)
+
+      - task: PublishPipelineArtifact@1
+        displayName: Publish snapshot artifact
+        condition: and(succeededOrFailed(), ne(variables['sessionId'], ''))
+        inputs:
+          targetPath: $(Build.ArtifactStagingDirectory)
+          artifact: workspace-snapshot-$(sessionId)
+          publishLocation: pipeline
+
+      - script: |
+          set -euo pipefail
+          rm -rf "$DBX_HOME"
+        displayName: Remove credentials from agent
+        condition: always()
+        env:
+          DBX_HOME: $(dbxHome)
+
+      - script: |
+          set -euo pipefail
+          # Keep the agent's disk bounded; the published artifacts are the
+          # archive, these directories only exist to let a run resume.
+          find "$EXPORT_ROOT" -mindepth 1 -maxdepth 1 -type d -mtime "+$KEEP_DAYS" \
+            -exec rm -rf {} + 2>/dev/null || true
+          df -h "$EXPORT_ROOT"
+        displayName: Prune old session directories
+        condition: always()
+        env:
+          EXPORT_ROOT: $(exportRoot)
+          KEEP_DAYS: $(keepSessionDays)

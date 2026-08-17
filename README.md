@@ -46,6 +46,13 @@ downloaded, and imported alongside notebooks by the existing `--workspace` and `
 allows a *variable* path segment to be excluded — most usefully the home directory of every service principal, whose
 name is a per-principal application id. See [Excluding workspace paths](#notebooks) for details.
 
+**Scheduled export from CI.** [`azure-pipelines.yml`](azure-pipelines.yml) and
+[`.github/workflows/databricks-export.yml`](.github/workflows/databricks-export.yml) run the export pipeline nightly on
+a self-hosted Linux agent/runner and publish each workspace snapshot as a build artifact. The two are equivalent; pick
+whichever platform you use. Credentials come from the `DATABRICKS_HOST` and `DATABRICKS_TOKEN` environment variables set
+on the machine running the agent. Setup — the agent requirements and how artifact retention becomes backup retention —
+is documented in the comment block at the top of each file.
+
 ## Pre-Requisites
 To use this migration tool, you'll need:  
 * An environment running linux with python, pip, git, and the databricks CLI installed.

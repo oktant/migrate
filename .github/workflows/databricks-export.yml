@@ -1,0 +1,274 @@
+# Scheduled full export of a Databricks workspace, published as a workflow
+# artifact. GitHub Actions counterpart of azure-pipelines.yml — same export,
+# same layout, same knobs.
+#
+# ---------------------------------------------------------------------------
+# One-time setup
+# ---------------------------------------------------------------------------
+# 1. Credentials. The workflow reads two environment variables from the
+#    self-hosted runner's environment:
+#      DATABRICKS_HOST   e.g. https://adb-1234567890123456.7.azuredatabricks.net
+#      DATABRICKS_TOKEN  a PAT for a workspace *admin*
+#    Set them on the runner — for a systemd runner service, an Environment= line
+#    or an EnvironmentFile= in the unit, or the runner's own .env file — then
+#    restart the runner so it picks them up.
+#
+#    GitHub masks repository secrets automatically but knows nothing about
+#    values that arrive this way, so the "Register credentials" step below feeds
+#    the token to ::add-mask:: at the start of every run. To use repository
+#    secrets instead, delete that step's reliance on the inherited environment
+#    and set `env:` on the job to ${{ secrets.DATABRICKS_HOST }} and
+#    ${{ secrets.DATABRICKS_TOKEN }}; everything downstream is unchanged.
+#
+#    Either way, any workflow running on this runner can read the token, so
+#    scope the runner group and the PAT accordingly.
+#
+# 2. Runner. Needs to be self-hosted and Linux: the export commonly outruns the
+#    GitHub-hosted limits, and `exportRoot` has to persist between runs for
+#    `--use-checkpoint` to resume a failed export. The runner user needs
+#    python3, python3-venv, git, and write access to `exportRoot`.
+#
+# 3. Retention. `retention-days` below is the backup retention — the artifact is
+#    deleted when it expires. 90 days is the ceiling unless the org raises the
+#    repository's artifact retention limit. Snapshots that must outlive it
+#    belong in blob storage, not here.
+#
+# 4. Metastore export. `metastore` and `metastore_table_acls` run SQL on a
+#    cluster, so METASTORE_CLUSTER must name a cluster the token can start.
+#    Leave it blank and pass both to `skipTasks` to export only workspace
+#    objects (much faster, no compute cost).
+#
+# 5. Scheduled workflows run only on the default branch, and GitHub disables
+#    them after 60 days without repository activity. If this repository goes
+#    quiet, the nightly export stops until someone re-enables it.
+#
+# 6. Enabling. This workflow is disabled by default — the `schedule` trigger
+#    below is commented out, so nothing runs until someone starts it from the
+#    Actions tab. Once a manual run has proved the credentials, the runner and
+#    the export itself, uncomment that trigger to start the nightly export.
+
+name: Databricks workspace export
+
+on:
+  # Disabled by default. With no `schedule` trigger registered, this workflow
+  # runs only from "Run workflow" in the Actions tab, which is also how you give
+  # it a first supervised trial. Uncomment the two lines below to turn on the
+  # nightly export; see setup note 6.
+  #
+  # schedule:
+  #   - cron: '0 1 * * *'
+  workflow_dispatch:
+    inputs:
+      session:
+        description: 'Resume session id (blank starts a new export)'
+        type: string
+        required: false
+        default: ''
+      skipTasks:
+        description: 'Tasks to skip (space separated, blank exports everything)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+# A long export must never overlap the next night's run: they would share the
+# checkpoint state under exportRoot.
+concurrency:
+  group: databricks-export
+  cancel-in-progress: false
+
+env:
+  # Persistent, outside the runner workspace, so checkpoints survive a re-run.
+  EXPORT_ROOT: /var/opt/databricks-migrate
+  # Cluster used for the hive metastore tasks; blank disables --cluster-name.
+  METASTORE_CLUSTER: ''
+  NUM_PARALLEL: '4'
+  # Regexes for workspace paths to leave out. The default drops the home
+  # directory of every service principal, whose name is a per-principal
+  # application id and so cannot be matched by a fixed prefix.
+  EXCLUDE_PATTERNS: '^/Users/[0-9a-fA-F-]{36}/'
+  # How many past session directories to keep on the runner's disk.
+  KEEP_SESSION_DAYS: '7'
+  ARTIFACT_RETENTION_DAYS: '90'
+
+jobs:
+  export:
+    name: Export workspace
+    runs-on: [self-hosted, linux]
+    # GitHub has no "unlimited"; unlike Azure DevOps this must be a real number.
+    # Raise it if a full export of your workspace runs longer than 24h.
+    timeout-minutes: 1440
+
+    env:
+      VENV: ${{ runner.temp }}/venv
+      # HOME override for the export: .databrickscfg is the only way this tool
+      # accepts credentials, and this keeps the token out of the runner user's
+      # real home directory, where it would outlive the run.
+      DBX_HOME: ${{ runner.temp }}/dbx-home
+      STAGING: ${{ runner.temp }}/staging
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install migration tool
+        run: |
+          set -euo pipefail
+          python3 -m venv "$VENV"
+          "$VENV/bin/pip" install --disable-pip-version-check --quiet --upgrade pip
+          "$VENV/bin/pip" install --disable-pip-version-check --quiet -e .
+          "$VENV/bin/python" -c 'import sys; print(sys.version)'
+
+      - name: Register credentials
+        run: |
+          set -euo pipefail
+          missing=0
+          if [ -z "${DATABRICKS_HOST:-}" ]; then
+            echo "::error::DATABRICKS_HOST is not set in the runner environment"
+            missing=1
+          fi
+          if [ -z "${DATABRICKS_TOKEN:-}" ]; then
+            echo "::error::DATABRICKS_TOKEN is not set in the runner environment"
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo "See the setup notes at the top of .github/workflows/databricks-export.yml."
+            exit 1
+          fi
+          # GitHub masks only values it has been told are secret. These arrive as
+          # ordinary environment variables, so register the token now; it is
+          # masked in the log from here to the end of the job.
+          echo "::add-mask::$DATABRICKS_TOKEN"
+          echo "Exporting from workspace $DATABRICKS_HOST"
+
+      - name: Write Databricks credentials
+        env:
+          # DATABRICKS_HOST and DATABRICKS_TOKEN are inherited from the runner
+          # environment; only HOME is overridden, to keep the written
+          # .databrickscfg inside this run's temp directory.
+          HOME: ${{ runner.temp }}/dbx-home
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$HOME"
+          printf '[DEFAULT]\nhost = %s\ntoken = %s\n' "$DATABRICKS_HOST" "$DATABRICKS_TOKEN" \
+            > "$HOME/.databrickscfg"
+          chmod 600 "$HOME/.databrickscfg"
+
+      - name: Verify workspace connectivity
+        env:
+          HOME: ${{ runner.temp }}/dbx-home
+        run: |
+          set -euo pipefail
+          # test_connection.py exits 0 even for a rejected token, so assert on
+          # its output rather than its exit code.
+          "$VENV/bin/python" test_connection.py --azure | tee "$RUNNER_TEMP/conn.txt"
+          grep -q 'Connection successful!' "$RUNNER_TEMP/conn.txt"
+
+      - name: Resolve session id
+        env:
+          RESUME_SESSION: ${{ inputs.session }}
+        run: |
+          set -euo pipefail
+          SESSION="${RESUME_SESSION:-}"
+          SESSION="${SESSION// /}"
+          if [ -z "$SESSION" ]; then
+            SESSION="M$(date -u +%Y%m%d).${GITHUB_RUN_NUMBER}"
+            echo "Starting a new export session: $SESSION"
+          else
+            echo "Resuming export session: $SESSION"
+          fi
+          mkdir -p "$EXPORT_ROOT"
+          echo "SESSION=$SESSION" >> "$GITHUB_ENV"
+
+      - name: Run export pipeline
+        env:
+          HOME: ${{ runner.temp }}/dbx-home
+          SKIP_TASKS: ${{ inputs.skipTasks }}
+        run: |
+          set -euo pipefail
+          ARGS=(--azure --export-pipeline --use-checkpoint --no-prompt
+                --session "$SESSION"
+                --set-export-dir "$EXPORT_ROOT"
+                --num-parallel "$NUM_PARALLEL"
+                --notebook-format DBC
+                --skip-large-nb)
+
+          if [ -n "${METASTORE_CLUSTER// /}" ]; then
+            ARGS+=(--cluster-name "$METASTORE_CLUSTER")
+          fi
+          # Unquoted on purpose: both variables are space-separated lists.
+          if [ -n "${SKIP_TASKS:-}" ]; then
+            ARGS+=(--skip-tasks $SKIP_TASKS)
+          fi
+          if [ -n "${EXCLUDE_PATTERNS// /}" ]; then
+            ARGS+=(--exclude-work-item-patterns $EXCLUDE_PATTERNS)
+          fi
+
+          echo "migration_pipeline.py ${ARGS[*]}"
+          "$VENV/bin/python" migration_pipeline.py "${ARGS[@]}"
+
+      - name: Report per-object export failures
+        if: always() && env.SESSION != ''
+        run: |
+          set -euo pipefail
+          # Per-object failures are logged to app_logs/failed_export_*.log and do
+          # not necessarily fail the workflow, so surface them as annotations.
+          # GitHub has no "succeeded with issues" state, so a run that reaches
+          # here still shows green — read the annotations before trusting it.
+          FAILED="$RUNNER_TEMP/failed-logs.txt"
+          : > "$FAILED"
+          find "$EXPORT_ROOT/$SESSION/app_logs" -name 'failed_export_*.log' -size +0c \
+            > "$FAILED" 2>/dev/null || true
+          if [ -s "$FAILED" ]; then
+            echo "::warning::Export finished with per-object failures"
+            echo '### Per-object export failures' >> "$GITHUB_STEP_SUMMARY"
+            while read -r f; do
+              echo "::warning::${f##*/}"
+              echo "- \`${f##*/}\`" >> "$GITHUB_STEP_SUMMARY"
+              head -n 20 "$f"
+            done < "$FAILED"
+          else
+            echo "No failed_export_*.log files with content."
+          fi
+
+      - name: Package snapshot
+        if: always() && env.SESSION != ''
+        run: |
+          set -euo pipefail
+          # One tarball rather than tens of thousands of loose notebook files:
+          # artifact upload is dominated by per-file overhead.
+          mkdir -p "$STAGING"
+          tar -czf "$STAGING/databricks-export-$SESSION.tar.gz" -C "$EXPORT_ROOT" "$SESSION"
+          ls -lh "$STAGING"
+          du -sh "$EXPORT_ROOT/$SESSION"
+
+      - name: Publish snapshot artifact
+        if: always() && env.SESSION != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-snapshot-${{ env.SESSION }}
+          path: ${{ runner.temp }}/staging
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: error
+          # Already a .tar.gz; a second compression pass would only cost time.
+          compression-level: 0
+
+      - name: Remove credentials from runner
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "$DBX_HOME"
+
+      - name: Prune old session directories
+        if: always()
+        run: |
+          set -euo pipefail
+          # Keep the runner's disk bounded; the published artifacts are the
+          # archive, these directories only exist to let a run resume.
+          find "$EXPORT_ROOT" -mindepth 1 -maxdepth 1 -type d -mtime "+$KEEP_SESSION_DAYS" \
+            -exec rm -rf {} + 2>/dev/null || true
+          df -h "$EXPORT_ROOT"
