@@ -23,6 +23,11 @@ WS_EXPORT = "/workspace/export"
 LS_ZONES = "/clusters/list-zones"
 REPOS = "/repos"
 
+# Objects can be deleted between the workspace listing and the export of their
+# contents, so a 404 on export means there is nothing left to export rather than
+# a failure worth terminating the pipeline over.
+EXPORT_IGNORE_ERROR_LIST = wmconstants.IGNORE_ERROR_LIST + ['RESOURCE_DOES_NOT_EXIST']
+
 class WorkspaceClient(dbclient):
     def __init__(self, configs, checkpoint_service):
         super().__init__(configs)
@@ -327,6 +332,17 @@ class WorkspaceClient(dbclient):
                     self.apply_acl_on_object(dir_acl_str, acl_dir_error_logger)
         self.set_export_dir(original_export_dir)
 
+    @staticmethod
+    def is_size_limit_error(resp):
+        """
+        Whether an export response failed because the object is over the size limit.
+        The API has worded this differently over time, e.g. 'Size exceeds 10485760 bytes'
+        and 'The notebook at ... has exceeded the memory limit 10485760 bytes.', so match
+        on the wording rather than on one exact string.
+        """
+        message = resp.get('message', '') or ''
+        return bool(re.search(r'size exceeds|exceeded the memory limit', message, re.IGNORECASE))
+
     def download_notebooks(self, ws_log_file='user_workspace.log', ws_dir='artifacts/', num_parallel=4):
         """
         Loop through all notebook paths in the logfile and download individual notebooks
@@ -372,11 +388,14 @@ class WorkspaceClient(dbclient):
             logging_utils.log_response_error(error_logger, resp)
             return resp
         if resp.get('error_code', None):
-            if self.skip_large_nb and resp.get("message", None) == 'Size exceeds 10485760 bytes':
+            if self.skip_large_nb and self.is_size_limit_error(resp):
                 logging.info("Notebook {} skipped due to size exceeding limit".format(notebook_path))
             else:
                 resp['path'] = notebook_path
-                logging_utils.log_response_error(error_logger, resp)
+                if not logging_utils.log_response_error(error_logger, resp,
+                                                       ignore_error_list=EXPORT_IGNORE_ERROR_LIST):
+                    logging.warning("Notebook {} skipped: {} - {}".format(
+                        notebook_path, resp.get('error_code'), resp.get('message')))
             return resp
         save_path = self.get_local_save_path(notebook_path, export_dir)
         save_filename = save_path + os.path.basename(notebook_path) + '.' + resp.get('file_type')
@@ -458,11 +477,14 @@ class WorkspaceClient(dbclient):
             logging_utils.log_response_error(error_logger, resp)
             return resp
         if resp.get('error_code', None):
-            if self.skip_large_nb and resp.get("message", None) == 'Size exceeds 10485760 bytes':
+            if self.skip_large_nb and self.is_size_limit_error(resp):
                 logging.info("Workspace file {} skipped due to size exceeding limit".format(file_path))
             else:
                 resp['path'] = file_path
-                logging_utils.log_response_error(error_logger, resp)
+                if not logging_utils.log_response_error(error_logger, resp,
+                                                       ignore_error_list=EXPORT_IGNORE_ERROR_LIST):
+                    logging.warning("Workspace file {} skipped: {} - {}".format(
+                        file_path, resp.get('error_code'), resp.get('message')))
             return resp
 
         save_path = self.get_local_save_path(file_path, export_dir)

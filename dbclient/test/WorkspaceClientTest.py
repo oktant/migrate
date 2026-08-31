@@ -1,10 +1,12 @@
 import base64
 import json
+import logging
 import os
 import tempfile
 import unittest
 from unittest.mock import MagicMock
 
+import wmconstants
 from dbclient import WorkspaceClient
 from thread_safe_writer import ThreadSafeWriter
 
@@ -171,3 +173,52 @@ class TestExcludedPaths(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestNotebookExportFailures(unittest.TestCase):
+
+    def setUp(self):
+        # get_error_logger adds a handler on every call, so drop the ones left behind by
+        # other tests, which point at temp directories that no longer exist
+        logger = logging.getLogger('workspace_migration_' + wmconstants.WORKSPACE_NOTEBOOK_OBJECT)
+        for handler in logger.handlers:
+            handler.close()
+        logger.handlers.clear()
+
+    def test_is_size_limit_error_matches_every_api_wording(self):
+        self.assertTrue(WorkspaceClient.is_size_limit_error({'message': 'Size exceeds 10485760 bytes'}))
+        self.assertTrue(WorkspaceClient.is_size_limit_error(
+            {'message': 'The notebook at /Users/foo@db.com/nb has exceeded the memory limit 10485760 bytes. '
+                        'Try clearing cell outputs or removing visualizations to reduce the size.'}))
+        self.assertFalse(WorkspaceClient.is_size_limit_error({'message': "Path (/Users/foo@db.com/nb) doesn't exist."}))
+        self.assertFalse(WorkspaceClient.is_size_limit_error({}))
+
+    def test_download_notebooks_only_logs_actionable_failures(self):
+        responses = {
+            '/Users/foo@db.com/big': {
+                'error_code': 'BAD_REQUEST', 'http_status_code': 400,
+                'message': 'The notebook at /Users/foo@db.com/big has exceeded the memory limit 10485760 bytes.'},
+            '/Users/foo@db.com/gone': {
+                'error_code': 'RESOURCE_DOES_NOT_EXIST', 'http_status_code': 404,
+                'message': "Path (/Users/foo@db.com/gone) doesn't exist."},
+            '/Users/foo@db.com/denied': {
+                'error_code': 'PERMISSION_DENIED', 'http_status_code': 403,
+                'message': 'User does not have permission to access this object.'}
+        }
+        with tempfile.TemporaryDirectory() as export_dir:
+            export_dir += '/'
+            ws_c = build_client(export_dir)
+            ws_c.skip_large_nb = True
+            with open(export_dir + 'user_workspace.log', 'w') as fp:
+                for path in responses:
+                    fp.write(json.dumps({'path': path, 'object_id': 1}) + '\n')
+            ws_c.get = MagicMock(side_effect=lambda endpoint, args: responses[args['path']])
+
+            ws_c.download_notebooks()
+
+            with open(export_dir + 'app_logs/failed_export_notebooks.log') as fp:
+                failures = [line for line in fp if line.strip()]
+            # an oversized notebook is skipped by --skip-large-nb, and a notebook deleted after the
+            # workspace listing has nothing left to export, so neither may abort the pipeline
+            self.assertEqual(len(failures), 1)
+            self.assertIn('PERMISSION_DENIED', failures[0])
