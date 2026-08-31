@@ -336,12 +336,14 @@ class WorkspaceClient(dbclient):
     def is_size_limit_error(resp):
         """
         Whether an export response failed because the object is over the size limit.
-        The API has worded this differently over time, e.g. 'Size exceeds 10485760 bytes'
-        and 'The notebook at ... has exceeded the memory limit 10485760 bytes.', so match
-        on the wording rather than on one exact string.
+        The API words this differently per object type and has changed the wording over
+        time, e.g. 'Size exceeds 10485760 bytes', '... has exceeded the memory limit
+        10485760 bytes.' and 'File size imported is (56018432 bytes), exceeded max size
+        (10485760 bytes)', so match on the two words every variant shares rather than on
+        any one phrasing.
         """
-        message = resp.get('message', '') or ''
-        return bool(re.search(r'size exceeds|exceeded the memory limit', message, re.IGNORECASE))
+        message = (resp.get('message', '') or '').lower()
+        return 'exceed' in message and 'bytes' in message
 
     def download_notebooks(self, ws_log_file='user_workspace.log', ws_dir='artifacts/', num_parallel=4):
         """

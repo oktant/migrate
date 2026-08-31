@@ -190,7 +190,12 @@ class TestNotebookExportFailures(unittest.TestCase):
         self.assertTrue(WorkspaceClient.is_size_limit_error(
             {'message': 'The notebook at /Users/foo@db.com/nb has exceeded the memory limit 10485760 bytes. '
                         'Try clearing cell outputs or removing visualizations to reduce the size.'}))
+        self.assertTrue(WorkspaceClient.is_size_limit_error(
+            {'message': 'File size imported is (56018432 bytes), exceeded max size (10485760 bytes)'}))
         self.assertFalse(WorkspaceClient.is_size_limit_error({'message': "Path (/Users/foo@db.com/nb) doesn't exist."}))
+        # a limit that is not about size must still be reported as a failure
+        self.assertFalse(WorkspaceClient.is_size_limit_error(
+            {'message': 'Request rate exceeded the allowed limit for this workspace'}))
         self.assertFalse(WorkspaceClient.is_size_limit_error({}))
 
     def test_download_notebooks_only_logs_actionable_failures(self):
@@ -222,3 +227,23 @@ class TestNotebookExportFailures(unittest.TestCase):
             # workspace listing has nothing left to export, so neither may abort the pipeline
             self.assertEqual(len(failures), 1)
             self.assertIn('PERMISSION_DENIED', failures[0])
+
+    def test_download_workspace_files_skips_oversized_files(self):
+        logger = logging.getLogger('workspace_migration_' + wmconstants.WORKSPACE_FILE_OBJECT)
+        for handler in logger.handlers:
+            handler.close()
+        logger.handlers.clear()
+        with tempfile.TemporaryDirectory() as export_dir:
+            export_dir += '/'
+            ws_c = build_client(export_dir)
+            ws_c.skip_large_nb = True
+            with open(export_dir + 'workspace_files.log', 'w') as fp:
+                fp.write(json.dumps({'path': '/Users/foo@db.com/big.csv', 'object_id': 1}) + '\n')
+            ws_c.get = MagicMock(return_value={
+                'error_code': 'BAD_REQUEST', 'http_status_code': 400,
+                'message': 'File size imported is (56018432 bytes), exceeded max size (10485760 bytes)'})
+
+            ws_c.download_workspace_files()
+
+            with open(export_dir + 'app_logs/failed_export_workspace_files.log') as fp:
+                self.assertEqual([line for line in fp if line.strip()], [])
